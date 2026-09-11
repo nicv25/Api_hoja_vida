@@ -524,7 +524,6 @@ def eliminar_estudio(hoja_vida_id, estudio_id):
 # RUTAS PARA EXPERIENCIAS LABORALES
 # =========================================================
 
-
 """OBTENER TODAS LAS EXPERIENCIAS DE UNA HOJA DE VIDA"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/experiencias_obtener", methods=["GET"])
@@ -547,7 +546,7 @@ def obtener_experiencias_por_hoja_vida(hoja_vida_id):
 
         """CONSULTAR LAS EXPERIENCIAS RELACIONADAS"""
 
-        sql = "SELECT id, hoja_vida_id, empresa, cargo, area, fecha_ingreso, fecha_retiro, funciones, referencia_laboral, certificado_laboral FROM experiencias WHERE hoja_vida_id = %s ORDER BY fecha_ingreso DESC"
+        sql = "SELECT hoja_vida_id, empresa, cargo, area, fecha_ingreso, fecha_retiro, funciones, referencia_laboral, certificado_laboral FROM experiencias WHERE hoja_vida_id = %s ORDER BY fecha_ingreso DESC"
         cursor.execute(sql, (hoja_vida_id,))
         experiencias = cursor.fetchall()
 
@@ -632,7 +631,7 @@ def obtener_experiencia_especifica(hoja_vida_id, experiencia_id):
         conexion = conectar_bd()
         cursor = conexion.cursor(dictionary=True)
 
-        sql = "SELECT id, hoja_vida_id, empresa, cargo, area, fecha_ingreso, fecha_retiro, funciones, referencia_laboral, certificado_laboral FROM experiencias WHERE id = %s AND hoja_vida_id = %s"
+        sql = "SELECT hoja_vida_id, empresa, cargo, area, fecha_ingreso, fecha_retiro, funciones, referencia_laboral, certificado_laboral FROM experiencias WHERE id = %s AND hoja_vida_id = %s"
         cursor.execute(sql, (experiencia_id, hoja_vida_id))
         experiencia = cursor.fetchone()
 
@@ -927,6 +926,221 @@ def eliminar_habilidad(experiencia_id, habilidad_id):
 
         if conexion and conexion.is_connected():
             conexion.close()
+
+
+# =========================================================
+# RUTAS PARA CURSOS
+# =========================================================
+
+
+"""OBTENER TODOS LOS CURSOS DE UNA HOJA DE VIDA"""
+
+@app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos_obtener", methods=["GET"])
+def obtener_cursos_por_hoja_vida(hoja_vida_id):
+    conexion = None
+    cursor = None
+
+    try:
+        conexion = conectar_bd()
+        cursor = conexion.cursor(dictionary=True)
+
+        """VERIFICAR QUE LA HOJA DE VIDA EXISTA"""
+
+        sql_hoja_vida = "SELECT id FROM hojas_vida WHERE id = %s"
+        cursor.execute(sql_hoja_vida, (hoja_vida_id,))
+        hoja_vida = cursor.fetchone()
+
+        if not hoja_vida:
+            return jsonify({"mensaje": "No se encontró la hoja de vida con el ID proporcionado"}), 404
+
+        """CONSULTAR LOS CURSOS RELACIONADOS"""
+
+        sql = "SELECT id, hoja_vida_id, nombre_curso FROM cursos WHERE hoja_vida_id = %s ORDER BY id ASC"
+        cursor.execute(sql, (hoja_vida_id,))
+        cursos = cursor.fetchall()
+
+        return jsonify({"mensaje": "Cursos encontrados", "hoja_vida_id": hoja_vida_id, "cantidad": len(cursos), "data": cursos}), 200
+
+    except Exception as error:
+        return jsonify({"mensaje": "Error al consultar los cursos", "error": str(error)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+
+"""REGISTRAR UN CURSO PARA UNA HOJA DE VIDA"""
+
+@app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos_registrar", methods=["POST"])
+def registrar_curso_por_hoja_vida(hoja_vida_id):
+    conexion = None
+    cursor = None
+
+    try:
+        datos = request.get_json(silent=True)
+
+        if not datos:
+            return jsonify({"mensaje": "Debe enviar la información del curso en formato JSON"}), 400
+
+        if "nombre_curso" not in datos or datos["nombre_curso"] in [None, ""]:
+            return jsonify({"mensaje": "El campo nombre_curso es obligatorio"}), 400
+
+        conexion = conectar_bd()
+        cursor = conexion.cursor()
+
+        """VERIFICAR QUE LA HOJA DE VIDA EXISTA"""
+
+        sql_hoja_vida = "SELECT id FROM hojas_vida WHERE id = %s"
+        cursor.execute(sql_hoja_vida, (hoja_vida_id,))
+        hoja_vida = cursor.fetchone()
+
+        if not hoja_vida:
+            return jsonify({"mensaje": "No se encontró la hoja de vida con el ID proporcionado"}), 404
+
+        """REGISTRAR EL CURSO"""
+
+        sql = "INSERT INTO cursos (hoja_vida_id, nombre_curso) VALUES (%s, %s)"
+        cursor.execute(sql, (hoja_vida_id, datos["nombre_curso"]))
+        conexion.commit()
+
+        id_curso_generado = cursor.lastrowid
+
+        return jsonify({"mensaje": "Curso registrado correctamente", "id_curso": id_curso_generado, "hoja_vida_id": hoja_vida_id}), 201
+
+    except Exception as error:
+        if conexion:
+            conexion.rollback()
+
+        return jsonify({"mensaje": "Error al registrar el curso", "error": str(error)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+
+"""CONSULTAR UN CURSO ESPECÍFICO"""
+
+@app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos/<int:curso_id>", methods=["GET"])
+def obtener_curso_especifico(hoja_vida_id, curso_id):
+    conexion = None
+    cursor = None
+
+    try:
+        conexion = conectar_bd()
+        cursor = conexion.cursor(dictionary=True)
+
+        sql = "SELECT id, hoja_vida_id, nombre_curso FROM cursos WHERE id = %s AND hoja_vida_id = %s"
+        cursor.execute(sql, (curso_id, hoja_vida_id))
+        curso = cursor.fetchone()
+
+        if not curso:
+            return jsonify({"mensaje": "No se encontró el curso para la hoja de vida indicada"}), 404
+
+        return jsonify({"mensaje": "Curso encontrado", "data": curso}), 200
+
+    except Exception as error:
+        return jsonify({"mensaje": "Error al consultar el curso", "error": str(error)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+
+"""ACTUALIZAR UN CURSO"""
+
+@app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos/<int:curso_id>", methods=["PUT"])
+def actualizar_curso(hoja_vida_id, curso_id):
+    conexion = None
+    cursor = None
+
+    try:
+        datos = request.get_json(silent=True)
+
+        if not datos:
+            return jsonify({"mensaje": "Debe enviar la información del curso en formato JSON"}), 400
+
+        if "nombre_curso" not in datos or datos["nombre_curso"] in [None, ""]:
+            return jsonify({"mensaje": "El campo nombre_curso es obligatorio"}), 400
+
+        conexion = conectar_bd()
+        cursor = conexion.cursor()
+
+        """ACTUALIZAR EL CURSO RELACIONADO CON LA HOJA DE VIDA"""
+
+        sql = "UPDATE cursos SET nombre_curso = %s WHERE id = %s AND hoja_vida_id = %s"
+        cursor.execute(sql, (datos["nombre_curso"], curso_id, hoja_vida_id))
+
+        if cursor.rowcount == 0:
+            return jsonify({"mensaje": "No se encontró el curso para la hoja de vida indicada"}), 404
+
+        conexion.commit()
+
+        return jsonify({"mensaje": "Curso actualizado correctamente", "id_curso": curso_id, "hoja_vida_id": hoja_vida_id}), 200
+
+    except Exception as error:
+        if conexion:
+            conexion.rollback()
+
+        return jsonify({"mensaje": "Error al actualizar el curso", "error": str(error)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+
+"""ELIMINAR UN CURSO"""
+
+@app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos/<int:curso_id>", methods=["DELETE"])
+def eliminar_curso(hoja_vida_id, curso_id):
+    conexion = None
+    cursor = None
+
+    try:
+        conexion = conectar_bd()
+        cursor = conexion.cursor()
+
+        """ELIMINAR EL CURSO RELACIONADO CON LA HOJA DE VIDA"""
+
+        sql = "DELETE FROM cursos WHERE id = %s AND hoja_vida_id = %s"
+        cursor.execute(sql, (curso_id, hoja_vida_id))
+
+        if cursor.rowcount == 0:
+            return jsonify({"mensaje": "No se encontró el curso para la hoja de vida indicada"}), 404
+
+        conexion.commit()
+
+        return jsonify({"mensaje": "Curso eliminado correctamente", "id_curso": curso_id, "hoja_vida_id": hoja_vida_id}), 200
+
+    except Exception as error:
+        if conexion:
+            conexion.rollback()
+
+        return jsonify({"mensaje": "Error al eliminar el curso", "error": str(error)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+
+
+
+
+
 
 # =========================================================
 # INICIAR LA APLICACIÓN
