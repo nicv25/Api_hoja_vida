@@ -1138,7 +1138,77 @@ def eliminar_curso(hoja_vida_id, curso_id):
 
 
 
+# =========================================================
+# RUTA PARA CONSULTA COMPLETA DE LA HOJA DE VIDA
+# =========================================================
 
+
+"""CONSULTAR TODA LA INFORMACIÓN DE UNA HOJA DE VIDA"""
+
+@app.route("/api/hojas-vida/<int:hoja_vida_id>/consulta_completa", methods=["GET"])
+def consultar_hoja_vida_completa(hoja_vida_id):
+    conexion = None
+    cursor = None
+
+    try:
+        conexion = conectar_bd()
+        cursor = conexion.cursor(dictionary=True)
+
+        """CONSULTAR LOS DATOS PERSONALES"""
+
+        sql_hoja_vida = "SELECT foto, nombres, apellidos, correo, direccion, perfil_profesional, fecha_registro FROM hojas_vida WHERE id = %s"
+        cursor.execute(sql_hoja_vida, (hoja_vida_id,))
+        hoja_vida = cursor.fetchone()
+
+        if not hoja_vida:
+            return jsonify({"mensaje": "No se encontró la hoja de vida con el ID proporcionado"}), 404
+
+        """CONSULTAR LAS FORMACIONES ACADÉMICAS"""
+
+        sql_estudios = "SELECT nivel_formacion, institucion, titulo_obtenido, fecha_inicio_academico, fecha_fin_academico, promedio FROM formaciones_academicas WHERE hoja_vida_id = %s ORDER BY fecha_inicio_academico DESC"
+        cursor.execute(sql_estudios, (hoja_vida_id,))
+        estudios = cursor.fetchall()
+
+        """CONSULTAR LOS CURSOS"""
+
+        sql_cursos = "SELECT nombre_curso FROM cursos WHERE hoja_vida_id = %s ORDER BY nombre_curso ASC"
+        cursor.execute(sql_cursos, (hoja_vida_id,))
+        cursos = cursor.fetchall()
+
+        """CONSULTAR LAS EXPERIENCIAS LABORALES"""
+
+        sql_experiencias = "SELECT id, hoja_vida_id, empresa, cargo, area, fecha_ingreso, fecha_retiro, funciones, referencia_laboral, certificado_laboral FROM experiencias WHERE hoja_vida_id = %s ORDER BY fecha_ingreso DESC"
+        cursor.execute(sql_experiencias, (hoja_vida_id,))
+        experiencias = cursor.fetchall()
+
+        """CONSULTAR LAS HABILIDADES DE CADA EXPERIENCIA"""
+
+        for experiencia in experiencias:
+            sql_habilidades = "SELECT nombre_habilidad FROM habilidades WHERE experiencia_id = %s ORDER BY id ASC"
+            cursor.execute(sql_habilidades, (experiencia["id"],))
+            habilidades = cursor.fetchall()
+            experiencia["habilidades"] = habilidades
+
+        """ORGANIZAR TODA LA INFORMACIÓN"""
+
+        resultado = {
+            "datos_personales": hoja_vida,
+            "estudios": estudios,
+            "cursos": cursos,
+            "experiencias": experiencias
+        }
+
+        return jsonify({"mensaje": "Información completa de la hoja de vida encontrada", "data": resultado}), 200
+
+    except Exception as error:
+        return jsonify({"mensaje": "Error al consultar la información completa de la hoja de vida", "error": str(error)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
 
 
 
