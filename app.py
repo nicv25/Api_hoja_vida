@@ -1,8 +1,16 @@
 from flask import Flask, jsonify, request
 from database import conectar_bd
+from flask_cors import CORS
 
 
 app = Flask(__name__)
+
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:5173"]
+    }
+})
+
 
 
 # =========================================================
