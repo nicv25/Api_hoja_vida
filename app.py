@@ -51,6 +51,163 @@ def inicio():
 # RUTAS PARA HOJAS DE VIDA
 # =========================================================
 
+### RUTAS PARA REGISTRO DE USUARIO Y LOGIN
+
+@app.route("/api/registro-usuario", methods=["POST"])
+def registro_usuario():
+    conexion = None
+    cursor = None
+
+    try:
+        datos = request.get_json(silent=True)
+
+        if not datos:
+            return jsonify({"mensaje": "Debe enviar la información en formato JSON"}), 400
+
+        campos_obligatorios = ["nombre", "correo", "password"]
+        campos_faltantes = [campo for campo in campos_obligatorios if campo not in datos or datos[campo] in [None, ""]]
+
+        if campos_faltantes:
+            return jsonify({"mensaje": "Faltan campos obligatorios", "campos_faltantes": campos_faltantes}), 400
+
+        conexion = conectar_bd()
+        cursor = conexion.cursor()
+
+        """VALIDAR QUE EL CORREO NO ESTÉ REGISTRADO"""
+
+        sql_correo = "SELECT id FROM usuarios WHERE correo = %s"
+        cursor.execute(sql_correo, (datos["correo"],))
+        usuario_existente = cursor.fetchone()
+
+        if usuario_existente:
+            return jsonify({"mensaje": "El correo ya está registrado"}), 409
+
+        """REGISTRAR EL USUARIO"""
+
+        sql = "INSERT INTO usuarios (nombre, correo, password) VALUES (%s, %s, %s)"
+
+        #VALIDACIONES CONTRASEÑA
+        #Validar que la contraseña tenga al menos 8 caracteres
+        if len(datos["password"]) < 8:
+            return jsonify({"mensaje": "La contraseña debe tener al menos 8 caracteres"}), 400
+
+        #Validar que la contraseña contenga al menos una letra mayúscula, una letra minúscula y un número
+        validaciones_obligatorias = [
+            lambda p: any(c.isupper() for c in p),
+            lambda p: any(c.islower() for c in p),
+            lambda p: any(c.isdigit() for c in p)
+        ]
+
+        if not all(validacion(datos["password"]) for validacion in validaciones_obligatorias):
+            return jsonify({"mensaje": "La contraseña debe contener al menos una letra mayúscula, una letra minúscula y un número"}), 400
+        
+
+        valores = (datos["nombre"], datos["correo"], datos["password"])
+        cursor.execute(sql, valores)
+        conexion.commit()
+
+        id_generado = cursor.lastrowid
+
+        return jsonify({"mensaje": "Usuario registrado correctamente", "id": id_generado}), 201
+    except Exception as error:
+        if conexion:
+            conexion.rollback()
+
+        return jsonify({"mensaje": "Error al registrar el usuario", "error": str(error)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
+    pass
+
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    conexion = None
+    cursor = None
+
+    try:
+        datos = request.get_json(silent=True)
+
+        if not datos:
+            return jsonify({"mensaje": "Debe enviar la información en formato JSON"}), 400
+
+        campos_obligatorios = ["nombre", "correo", "password"]
+        campos_faltantes = [campo for campo in campos_obligatorios if campo not in datos or datos[campo] in [None, ""]]
+
+        if campos_faltantes:
+            return jsonify({"mensaje": "Faltan campos obligatorios", "campos_faltantes": campos_faltantes}), 400
+
+
+        conexion = conectar_bd()
+        cursor = conexion.cursor(dictionary=True)
+
+        """VALIDAR CREDENCIALES DEL USUARIO"""
+
+        #Validaciones login usuario aprendiz
+
+        Validaciones_login = [
+            lambda d: "@" in d["correo"] and "." in d["correo"], 
+            lambda d: len(d["password"]) >= 8
+        ]
+
+        if not all(validacion(datos) for validacion in Validaciones_login):
+            return jsonify({"mensaje": "Credenciales inválidas"}), 401
+
+        sql = "SELECT * FROM usuarios WHERE correo = %s AND password = %s"
+        cursor.execute(sql, (datos["correo"], datos["password"]))
+        usuario = cursor.fetchone()
+
+        if usuario and usuario["correo"] != datos["correo"]:
+            return jsonify({"mensaje": "El correo no coincide con el registrado"}), 401
+        if usuario and usuario["password"] != datos["password"]:
+            return jsonify({"mensaje": "La contraseña no coincide con la registrada"}), 401
+        if usuario and usuario["nombre"] != datos["nombre"]:
+            return jsonify({"mensaje": "El nombre no coincide con el registrado"}), 401
+        if usuario and usuario["rol"] != "aprendiz":
+            return jsonify({"mensaje": "No tienes el estado de aprendiz"}), 403
+
+        #validar que el usuario exista por correo
+        validar_usuario = "SELECT id FROM usuarios WHERE correo = %s"
+        cursor.execute(validar_usuario, (datos["correo"],))
+        usuario_existente = cursor.fetchone()
+        if not usuario_existente:
+            return jsonify({"mensaje": "El correo no está registrado"}), 404
+
+        #validar que el usuario exista por nombre
+        validar_nombre = "SELECT id FROM usuarios WHERE nombre = %s"    
+        cursor.execute(validar_nombre, (datos["nombre"],))
+        usuario_existente = cursor.fetchone()
+        if not usuario_existente:
+            return jsonify({"mensaje": "El nombre no está registrado"}), 404
+
+        #validar el estado del usuario
+        validar_estado = "SELECT id, rol FROM usuarios WHERE correo = %s AND password = %s"
+        cursor.execute(validar_estado, (datos["correo"], datos["password"]))
+        usuario = cursor.fetchone()
+        if usuario and usuario["rol"] != "aprendiz":
+            return jsonify({"mensaje": "no tienes el estado de aprendiz"}), 403
+
+
+        if not usuario:
+            return jsonify({"mensaje": "Credenciales inválidas"}), 401
+
+        return jsonify({"mensaje": "Inicio de sesión exitoso", "usuario": usuario , "token": "token_generado"}), 200
+    except Exception as error:
+        if conexion:
+            conexion.rollback()
+
+        return jsonify({"mensaje": "Error al iniciar sesión", "error": str(error)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
+    pass
 
 """REGISTRAR UNA HOJA DE VIDA"""
 
