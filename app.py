@@ -1,6 +1,13 @@
+import os
+from datetime import timedelta
+from functools import wraps
+
 from flask import Flask, jsonify, request
-from database import conectar_bd
 from flask_cors import CORS
+from flask_jwt_extended import JWTManager, create_access_token, get_jwt, get_jwt_identity, jwt_required
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from database import conectar_bd
 
 
 app = Flask(__name__)
@@ -11,6 +18,95 @@ CORS(app, resources={
     }
 })
 
+# Clave con la que se firman los tokens JWT (en producción se define como variable de entorno)
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "clave-secreta-solo-para-desarrollo-hoja-vida")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=2)
+
+jwt = JWTManager(app)
+
+
+# =========================================================
+# PROTECCIÓN DE RUTAS SEGÚN EL ROL
+# =========================================================
+
+
+"""EXIGIR UN TOKEN VÁLIDO Y UN ROL ESPECÍFICO"""
+
+def rol_requerido(rol):
+    def decorador(funcion):
+        @wraps(funcion)
+        @jwt_required()
+        def wrapper(*args, **kwargs):
+            if get_jwt().get("rol") != rol:
+                return jsonify({"mensaje": "No tienes permisos para acceder"}), 403
+
+            return funcion(*args, **kwargs)
+
+        return wrapper
+
+    return decorador
+
+
+"""EXIGIR ACCESO A UNA HOJA DE VIDA O A UNA EXPERIENCIA
+
+- Lectura: el reclutador accede a todas y el aprendiz solo a las suyas.
+- Escritura (crear, actualizar, eliminar): solo el aprendiz dueño de la hoja de vida.
+"""
+
+CONSULTAS_PROPIETARIO = {
+    "hoja_vida": "SELECT usuario_id FROM hojas_vida WHERE id = %s",
+    "experiencia": "SELECT hv.usuario_id FROM experiencias e INNER JOIN hojas_vida hv ON hv.id = e.hoja_vida_id WHERE e.id = %s"
+}
+
+MENSAJES_NO_ENCONTRADO = {
+    "hoja_vida": "No se encontró la hoja de vida con el ID proporcionado",
+    "experiencia": "No se encontró la experiencia con el ID proporcionado"
+}
+
+def acceso_recurso(recurso, parametro, escritura=False):
+    def decorador(funcion):
+        @wraps(funcion)
+        @jwt_required()
+        def wrapper(*args, **kwargs):
+            rol = get_jwt().get("rol")
+
+            if rol == "reclutador" and not escritura:
+                return funcion(*args, **kwargs)
+
+            if rol != "aprendiz":
+                return jsonify({"mensaje": "No tienes permisos para acceder"}), 403
+
+            conexion = None
+            cursor = None
+
+            try:
+                conexion = conectar_bd()
+                cursor = conexion.cursor()
+
+                cursor.execute(CONSULTAS_PROPIETARIO[recurso], (kwargs[parametro],))
+                fila = cursor.fetchone()
+
+            except Exception as error:
+                return jsonify({"mensaje": "Error al validar los permisos", "error": str(error)}), 500
+
+            finally:
+                if cursor:
+                    cursor.close()
+
+                if conexion and conexion.is_connected():
+                    conexion.close()
+
+            if not fila:
+                return jsonify({"mensaje": MENSAJES_NO_ENCONTRADO[recurso]}), 404
+
+            if fila[0] != int(get_jwt_identity()):
+                return jsonify({"mensaje": "No tienes permisos para acceder a esta hoja de vida"}), 403
+
+            return funcion(*args, **kwargs)
+
+        return wrapper
+
+    return decorador
 
 
 # =========================================================
@@ -53,6 +149,28 @@ def inicio():
 
 ### RUTAS PARA REGISTRO DE USUARIO Y LOGIN
 
+"""VALIDAR LOS DATOS DEL REGISTRO DE USUARIO"""
+
+def validar_datos_registro(datos):
+    campos_obligatorios = ["nombre", "correo", "password"]
+    campos_faltantes = [campo for campo in campos_obligatorios if not isinstance(datos.get(campo), str) or not datos[campo].strip()]
+
+    if campos_faltantes:
+        return {"mensaje": "Faltan campos obligatorios", "campos_faltantes": campos_faltantes}
+
+    password = datos["password"]
+
+    #Validar que la contraseña tenga al menos 8 caracteres
+    if len(password) < 8:
+        return {"mensaje": "La contraseña debe tener al menos 8 caracteres"}
+
+    #Validar que la contraseña contenga al menos una letra mayúscula, una letra minúscula y un número
+    if not (any(c.isupper() for c in password) and any(c.islower() for c in password) and any(c.isdigit() for c in password)):
+        return {"mensaje": "La contraseña debe contener al menos una letra mayúscula, una letra minúscula y un número"}
+
+    return None
+
+
 @app.route("/api/registro-usuario", methods=["POST"])
 def registro_usuario():
     conexion = None
@@ -61,14 +179,16 @@ def registro_usuario():
     try:
         datos = request.get_json(silent=True)
 
-        if not datos:
+        if not isinstance(datos, dict) or not datos:
             return jsonify({"mensaje": "Debe enviar la información en formato JSON"}), 400
 
-        campos_obligatorios = ["nombre", "correo", "password"]
-        campos_faltantes = [campo for campo in campos_obligatorios if campo not in datos or datos[campo] in [None, ""]]
+        error_validacion = validar_datos_registro(datos)
 
-        if campos_faltantes:
-            return jsonify({"mensaje": "Faltan campos obligatorios", "campos_faltantes": campos_faltantes}), 400
+        if error_validacion:
+            return jsonify(error_validacion), 400
+
+        nombre = datos["nombre"].strip()
+        correo = datos["correo"].strip().lower()
 
         conexion = conectar_bd()
         cursor = conexion.cursor()
@@ -76,7 +196,7 @@ def registro_usuario():
         """VALIDAR QUE EL CORREO NO ESTÉ REGISTRADO"""
 
         sql_correo = "SELECT id FROM usuarios WHERE correo = %s"
-        cursor.execute(sql_correo, (datos["correo"],))
+        cursor.execute(sql_correo, (correo,))
         usuario_existente = cursor.fetchone()
 
         if usuario_existente:
@@ -84,45 +204,32 @@ def registro_usuario():
 
         """REGISTRAR EL USUARIO"""
 
-        sql = "INSERT INTO usuarios (nombre, correo, password) VALUES (%s, %s, %s)"
+        # El registro público siempre crea un aprendiz y la contraseña se guarda como hash
+        password_hash = generate_password_hash(datos["password"])
 
-        #VALIDACIONES CONTRASEÑA
-        #Validar que la contraseña tenga al menos 8 caracteres
-        if len(datos["password"]) < 8:
-            return jsonify({"mensaje": "La contraseña debe tener al menos 8 caracteres"}), 400
-
-        #Validar que la contraseña contenga al menos una letra mayúscula, una letra minúscula y un número
-        validaciones_obligatorias = [
-            lambda p: any(c.isupper() for c in p),
-            lambda p: any(c.islower() for c in p),
-            lambda p: any(c.isdigit() for c in p)
-        ]
-
-        if not all(validacion(datos["password"]) for validacion in validaciones_obligatorias):
-            return jsonify({"mensaje": "La contraseña debe contener al menos una letra mayúscula, una letra minúscula y un número"}), 400
-        
-
-        valores = (datos["nombre"], datos["correo"], datos["password"])
-        cursor.execute(sql, valores)
+        sql = "INSERT INTO usuarios (nombre, correo, password, rol, estado) VALUES (%s, %s, %s, 'aprendiz', 1)"
+        cursor.execute(sql, (nombre, correo, password_hash))
         conexion.commit()
 
         id_generado = cursor.lastrowid
 
         return jsonify({"mensaje": "Usuario registrado correctamente", "id": id_generado}), 201
+
     except Exception as error:
         if conexion:
             conexion.rollback()
 
         return jsonify({"mensaje": "Error al registrar el usuario", "error": str(error)}), 500
+
     finally:
         if cursor:
             cursor.close()
 
         if conexion and conexion.is_connected():
             conexion.close()
-    pass
 
 
+"""INICIAR SESIÓN Y GENERAR EL TOKEN JWT"""
 
 @app.route("/api/login", methods=["POST"])
 def login():
@@ -132,91 +239,73 @@ def login():
     try:
         datos = request.get_json(silent=True)
 
-        if not datos:
+        if not isinstance(datos, dict) or not datos:
             return jsonify({"mensaje": "Debe enviar la información en formato JSON"}), 400
 
-        campos_obligatorios = ["nombre", "correo", "password"]
-        campos_faltantes = [campo for campo in campos_obligatorios if campo not in datos or datos[campo] in [None, ""]]
+        correo = str(datos.get("correo") or "").strip().lower()
+        password = str(datos.get("password") or "")
 
-        if campos_faltantes:
-            return jsonify({"mensaje": "Faltan campos obligatorios", "campos_faltantes": campos_faltantes}), 400
-
+        if not correo or not password:
+            return jsonify({"mensaje": "Correo y contraseña son obligatorios"}), 400
 
         conexion = conectar_bd()
         cursor = conexion.cursor(dictionary=True)
 
-        """VALIDAR CREDENCIALES DEL USUARIO"""
+        """BUSCAR EL USUARIO POR CORREO Y VERIFICAR LA CONTRASEÑA"""
 
-        #Validaciones login usuario aprendiz
-
-        Validaciones_login = [
-            lambda d: "@" in d["correo"] and "." in d["correo"], 
-            lambda d: len(d["password"]) >= 8
-        ]
-
-        if not all(validacion(datos) for validacion in Validaciones_login):
-            return jsonify({"mensaje": "Credenciales inválidas"}), 401
-
-        sql = "SELECT * FROM usuarios WHERE correo = %s AND password = %s"
-        cursor.execute(sql, (datos["correo"], datos["password"]))
+        cursor.execute("SELECT id, nombre, correo, password, rol, estado FROM usuarios WHERE correo = %s", (correo,))
         usuario = cursor.fetchone()
 
-        if usuario and usuario["correo"] != datos["correo"]:
-            return jsonify({"mensaje": "El correo no coincide con el registrado"}), 401
-        if usuario and usuario["password"] != datos["password"]:
-            return jsonify({"mensaje": "La contraseña no coincide con la registrada"}), 401
-        if usuario and usuario["nombre"] != datos["nombre"]:
-            return jsonify({"mensaje": "El nombre no coincide con el registrado"}), 401
-        if usuario and usuario["rol"] != "aprendiz":
-            return jsonify({"mensaje": "No tienes el estado de aprendiz"}), 403
+        if not usuario or not check_password_hash(usuario["password"], password):
+            return jsonify({"mensaje": "Correo o contraseña incorrectos"}), 401
 
-        #validar que el usuario exista por correo
-        validar_usuario = "SELECT id FROM usuarios WHERE correo = %s"
-        cursor.execute(validar_usuario, (datos["correo"],))
-        usuario_existente = cursor.fetchone()
-        if not usuario_existente:
-            return jsonify({"mensaje": "El correo no está registrado"}), 404
+        """COMPROBAR QUE LA CUENTA ESTÉ ACTIVA"""
 
-        #validar que el usuario exista por nombre
-        validar_nombre = "SELECT id FROM usuarios WHERE nombre = %s"    
-        cursor.execute(validar_nombre, (datos["nombre"],))
-        usuario_existente = cursor.fetchone()
-        if not usuario_existente:
-            return jsonify({"mensaje": "El nombre no está registrado"}), 404
+        if not usuario["estado"]:
+            return jsonify({"mensaje": "Cuenta desactivada"}), 403
 
-        #validar el estado del usuario
-        validar_estado = "SELECT id, rol FROM usuarios WHERE correo = %s AND password = %s"
-        cursor.execute(validar_estado, (datos["correo"], datos["password"]))
-        usuario = cursor.fetchone()
-        if usuario and usuario["rol"] != "aprendiz":
-            return jsonify({"mensaje": "no tienes el estado de aprendiz"}), 403
+        """GENERAR EL TOKEN CON LA IDENTIDAD Y EL ROL DEL USUARIO"""
 
+        token = create_access_token(
+            identity=str(usuario["id"]),
+            additional_claims={"rol": usuario["rol"]}
+        )
 
-        if not usuario:
-            return jsonify({"mensaje": "Credenciales inválidas"}), 401
+        return jsonify({
+            "mensaje": "Inicio de sesión correcto",
+            "token": token,
+            "usuario": {
+                "id": usuario["id"],
+                "nombre": usuario["nombre"],
+                "correo": usuario["correo"],
+                "rol": usuario["rol"]
+            }
+        }), 200
 
-        return jsonify({"mensaje": "Inicio de sesión exitoso", "usuario": usuario , "token": "token_generado"}), 200
     except Exception as error:
-        if conexion:
-            conexion.rollback()
-
         return jsonify({"mensaje": "Error al iniciar sesión", "error": str(error)}), 500
+
     finally:
         if cursor:
             cursor.close()
 
         if conexion and conexion.is_connected():
             conexion.close()
-    pass
+
 
 """REGISTRAR UNA HOJA DE VIDA"""
 
 @app.route("/api/registrohv", methods=["POST"])
+# Solo un aprendiz con token válido puede registrar su hoja de vida
+@rol_requerido("aprendiz")
 def registrohv():
     conexion = None
     cursor = None
 
     try:
+        # El usuario_id se obtiene del token, así la hoja de vida queda asociada a la cuenta autenticada
+        usuario_id = int(get_jwt_identity())
+
         datos = request.get_json(silent=True)
 
         if not datos:
@@ -240,10 +329,18 @@ def registrohv():
         if hoja_vida_existente:
             return jsonify({"mensaje": "El correo ya está registrado"}), 409
 
+        """VALIDAR QUE EL APRENDIZ NO TENGA YA UNA HOJA DE VIDA"""
+
+        sql_usuario = "SELECT id FROM hojas_vida WHERE usuario_id = %s"
+        cursor.execute(sql_usuario, (usuario_id,))
+
+        if cursor.fetchone():
+            return jsonify({"mensaje": "Ya tienes una hoja de vida registrada"}), 409
+
         """REGISTRAR LA HOJA DE VIDA"""
 
-        sql = "INSERT INTO hojas_vida (foto, nombres, apellidos, correo, direccion, perfil_profesional) VALUES (%s, %s, %s, %s, %s, %s)"
-        valores = (datos.get("foto"), datos["nombres"], datos["apellidos"], datos["correo"], datos["direccion"], datos["perfil_profesional"])
+        sql = "INSERT INTO hojas_vida (usuario_id, foto, nombres, apellidos, correo, direccion, perfil_profesional) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+        valores = (usuario_id, datos.get("foto"), datos["nombres"], datos["apellidos"], datos["correo"], datos["direccion"], datos["perfil_profesional"])
 
         cursor.execute(sql, valores)
         conexion.commit()
@@ -269,6 +366,8 @@ def registrohv():
 """LISTAR TODAS LAS HOJAS DE VIDA"""
 
 @app.route("/api/hojas-vida/listado", methods=["GET"])
+# Solo el reclutador puede consultar hojas de vida de cualquier aprendiz
+@rol_requerido("reclutador")
 def listar_hojas_vida():
     conexion = None
     cursor = None
@@ -298,6 +397,8 @@ def listar_hojas_vida():
 """CONSULTAR UNA HOJA DE VIDA POR CORREO"""
 
 @app.route("/api/hojas-vida/correo/<string:correo>", methods=["GET"])
+# Solo el reclutador puede consultar hojas de vida de cualquier aprendiz
+@rol_requerido("reclutador")
 def obtener_hoja_vida_por_correo(correo):
     conexion = None
     cursor = None
@@ -330,6 +431,8 @@ def obtener_hoja_vida_por_correo(correo):
 """CONSULTAR UNA HOJA DE VIDA POR ID"""
 
 @app.route("/api/consultar_hoja_vida/<int:id>", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("hoja_vida", "id")
 def obtener_hoja_vida_por_id(id):
     conexion = None
     cursor = None
@@ -362,6 +465,8 @@ def obtener_hoja_vida_por_id(id):
 """ACTUALIZAR UNA HOJA DE VIDA POR ID"""
 
 @app.route("/api/actualizar_hoja_vida/<int:id>", methods=["PUT"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "id", escritura=True)
 def actualizar_hoja_vida(id):
     conexion = None
     cursor = None
@@ -426,6 +531,8 @@ def actualizar_hoja_vida(id):
 """ELIMINAR UNA HOJA DE VIDA POR ID"""
 
 @app.route("/api/borrar_hoja_vida/<int:id>", methods=["DELETE"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "id", escritura=True)
 def eliminar_hoja_vida(id):
     conexion = None
     cursor = None
@@ -473,6 +580,8 @@ def eliminar_hoja_vida(id):
 """OBTENER TODOS LOS ESTUDIOS DE UNA HOJA DE VIDA"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/estudios_obtener", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("hoja_vida", "hoja_vida_id")
 def obtener_estudios_por_hoja_vida(hoja_vida_id):
     conexion = None
     cursor = None
@@ -512,6 +621,8 @@ def obtener_estudios_por_hoja_vida(hoja_vida_id):
 """REGISTRAR UN ESTUDIO PARA UNA HOJA DE VIDA"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/estudios_registrar", methods=["POST"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def registrar_estudio_por_hoja_vida(hoja_vida_id):
     conexion = None
     cursor = None
@@ -569,6 +680,8 @@ def registrar_estudio_por_hoja_vida(hoja_vida_id):
 """CONSULTAR UN ESTUDIO ESPECÍFICO"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/estudios/<int:estudio_id>", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("hoja_vida", "hoja_vida_id")
 def obtener_estudio_especifico(hoja_vida_id, estudio_id):
     conexion = None
     cursor = None
@@ -601,6 +714,8 @@ def obtener_estudio_especifico(hoja_vida_id, estudio_id):
 """ACTUALIZAR UN ESTUDIO"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/estudios/<int:estudio_id>", methods=["PUT"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def actualizar_estudio(hoja_vida_id, estudio_id):
     conexion = None
     cursor = None
@@ -651,6 +766,8 @@ def actualizar_estudio(hoja_vida_id, estudio_id):
 """ELIMINAR UN ESTUDIO"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/estudios/<int:estudio_id>", methods=["DELETE"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def eliminar_estudio(hoja_vida_id, estudio_id):
     conexion = None
     cursor = None
@@ -692,6 +809,8 @@ def eliminar_estudio(hoja_vida_id, estudio_id):
 """OBTENER TODAS LAS EXPERIENCIAS DE UNA HOJA DE VIDA"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/experiencias_obtener", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("hoja_vida", "hoja_vida_id")
 def obtener_experiencias_por_hoja_vida(hoja_vida_id):
     conexion = None
     cursor = None
@@ -731,6 +850,8 @@ def obtener_experiencias_por_hoja_vida(hoja_vida_id):
 """REGISTRAR UNA EXPERIENCIA LABORAL"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/experiencias_registrar", methods=["POST"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def registrar_experiencia_por_hoja_vida(hoja_vida_id):
     conexion = None
     cursor = None
@@ -788,6 +909,8 @@ def registrar_experiencia_por_hoja_vida(hoja_vida_id):
 """CONSULTAR UNA EXPERIENCIA LABORAL ESPECÍFICA"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/experiencias/<int:experiencia_id>", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("hoja_vida", "hoja_vida_id")
 def obtener_experiencia_especifica(hoja_vida_id, experiencia_id):
     conexion = None
     cursor = None
@@ -819,6 +942,8 @@ def obtener_experiencia_especifica(hoja_vida_id, experiencia_id):
 """ACTUALIZAR UNA EXPERIENCIA LABORAL"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/experiencias/<int:experiencia_id>", methods=["PUT"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def actualizar_experiencia(hoja_vida_id, experiencia_id):
     conexion = None
     cursor = None
@@ -871,6 +996,8 @@ def actualizar_experiencia(hoja_vida_id, experiencia_id):
 """ELIMINAR UNA EXPERIENCIA LABORAL"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/experiencias/<int:experiencia_id>", methods=["DELETE"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def eliminar_experiencia(hoja_vida_id, experiencia_id):
     conexion = None
     cursor = None
@@ -914,6 +1041,8 @@ def eliminar_experiencia(hoja_vida_id, experiencia_id):
 """OBTENER TODAS LAS HABILIDADES DE UNA EXPERIENCIA"""
 
 @app.route("/api/experiencias/<int:experiencia_id>/habilidades_obtener", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("experiencia", "experiencia_id")
 def obtener_habilidades_por_experiencia(experiencia_id):
     conexion = None
     cursor = None
@@ -953,6 +1082,8 @@ def obtener_habilidades_por_experiencia(experiencia_id):
 """REGISTRAR UNA HABILIDAD PARA UNA EXPERIENCIA"""
 
 @app.route("/api/experiencias/<int:experiencia_id>/habilidades_registrar", methods=["POST"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("experiencia", "experiencia_id", escritura=True)
 def registrar_habilidad_por_experiencia(experiencia_id):
     conexion = None
     cursor = None
@@ -1014,6 +1145,8 @@ def registrar_habilidad_por_experiencia(experiencia_id):
 """ACTUALIZAR UNA HABILIDAD"""
 
 @app.route("/api/experiencias/<int:experiencia_id>/habilidades/<int:habilidad_id>", methods=["PUT"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("experiencia", "experiencia_id", escritura=True)
 def actualizar_habilidad(experiencia_id, habilidad_id):
     conexion = None
     cursor = None
@@ -1059,6 +1192,8 @@ def actualizar_habilidad(experiencia_id, habilidad_id):
 """ELIMINAR UNA HABILIDAD"""
 
 @app.route("/api/experiencias/<int:experiencia_id>/habilidades/<int:habilidad_id>", methods=["DELETE"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("experiencia", "experiencia_id", escritura=True)
 def eliminar_habilidad(experiencia_id, habilidad_id):
     conexion = None
     cursor = None
@@ -1101,6 +1236,8 @@ def eliminar_habilidad(experiencia_id, habilidad_id):
 """OBTENER TODOS LOS CURSOS DE UNA HOJA DE VIDA"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos_obtener", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("hoja_vida", "hoja_vida_id")
 def obtener_cursos_por_hoja_vida(hoja_vida_id):
     conexion = None
     cursor = None
@@ -1140,6 +1277,8 @@ def obtener_cursos_por_hoja_vida(hoja_vida_id):
 """REGISTRAR UN CURSO PARA UNA HOJA DE VIDA"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos_registrar", methods=["POST"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def registrar_curso_por_hoja_vida(hoja_vida_id):
     conexion = None
     cursor = None
@@ -1192,6 +1331,8 @@ def registrar_curso_por_hoja_vida(hoja_vida_id):
 """CONSULTAR UN CURSO ESPECÍFICO"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos/<int:curso_id>", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("hoja_vida", "hoja_vida_id")
 def obtener_curso_especifico(hoja_vida_id, curso_id):
     conexion = None
     cursor = None
@@ -1223,6 +1364,8 @@ def obtener_curso_especifico(hoja_vida_id, curso_id):
 """ACTUALIZAR UN CURSO"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos/<int:curso_id>", methods=["PUT"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def actualizar_curso(hoja_vida_id, curso_id):
     conexion = None
     cursor = None
@@ -1268,6 +1411,8 @@ def actualizar_curso(hoja_vida_id, curso_id):
 """ELIMINAR UN CURSO"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/cursos/<int:curso_id>", methods=["DELETE"])
+# Solo el aprendiz dueño de la hoja de vida puede modificar la información (el reclutador solo consulta)
+@acceso_recurso("hoja_vida", "hoja_vida_id", escritura=True)
 def eliminar_curso(hoja_vida_id, curso_id):
     conexion = None
     cursor = None
@@ -1308,9 +1453,50 @@ def eliminar_curso(hoja_vida_id, curso_id):
 # =========================================================
 
 
+"""CONSULTAR LA HOJA DE VIDA PROPIA DEL APRENDIZ AUTENTICADO"""
+
+@app.route("/api/mi-hoja-vida", methods=["GET"])
+# Solo un aprendiz con token válido; la hoja de vida se identifica con el usuario_id del token
+@rol_requerido("aprendiz")
+def mi_hoja_vida():
+    conexion = None
+    cursor = None
+
+    try:
+        usuario_id = int(get_jwt_identity())
+
+        conexion = conectar_bd()
+        cursor = conexion.cursor(dictionary=True)
+
+        """BUSCAR LA HOJA DE VIDA QUE PERTENECE A ESTE USUARIO"""
+
+        cursor.execute("SELECT id FROM hojas_vida WHERE usuario_id = %s", (usuario_id,))
+        hoja_vida = cursor.fetchone()
+
+        if not hoja_vida:
+            return jsonify({"mensaje": "Aún no has registrado tu hoja de vida"}), 404
+
+        hoja_vida_id = hoja_vida["id"]
+
+    except Exception as error:
+        return jsonify({"mensaje": "Error al consultar tu hoja de vida", "error": str(error)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+    # Se reutiliza la consulta completa: datos personales, estudios, cursos, experiencias y habilidades
+    return consultar_hoja_vida_completa(hoja_vida_id=hoja_vida_id)
+
+
 """CONSULTAR TODA LA INFORMACIÓN DE UNA HOJA DE VIDA"""
 
 @app.route("/api/hojas-vida/<int:hoja_vida_id>/consulta_completa", methods=["GET"])
+# El reclutador accede a todas; el aprendiz solo a la información de su propia hoja de vida
+@acceso_recurso("hoja_vida", "hoja_vida_id")
 def consultar_hoja_vida_completa(hoja_vida_id):
     conexion = None
     cursor = None
